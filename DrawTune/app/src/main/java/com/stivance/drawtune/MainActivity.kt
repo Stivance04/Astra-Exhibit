@@ -5,7 +5,14 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.content.Context
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.SocketTimeoutException
+import java.util.concurrent.Executors
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
@@ -15,6 +22,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.Row
@@ -22,6 +30,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -34,8 +44,11 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -56,12 +69,145 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.BoxWithConstraints
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlin.math.PI
+import kotlin.math.exp
 import kotlin.math.sin
+import kotlin.math.cos
+import kotlin.math.floor
+import kotlin.math.roundToInt
+import kotlin.math.abs
 import org.json.JSONArray
 import org.json.JSONObject
+
+
+// ============================================================
+// ESP32 WI-FI UDP CONNECTION
+// ============================================================
+
+class DrawTuneWifiManager {
+
+    companion object {
+        const val DEFAULT_PORT = 4210
+    }
+
+    private var socket: DatagramSocket? = null
+    private var targetAddress: InetAddress? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val sendExecutor = Executors.newSingleThreadExecutor()
+
+    @Volatile
+    var connected: Boolean = false
+        private set
+
+    fun connect(
+        ipAddress: String,
+        onResult: (Boolean, String) -> Unit
+    ) {
+        disconnect()
+
+        Thread {
+            try {
+                val address = InetAddress.getByName(ipAddress.trim())
+                val newSocket = DatagramSocket()
+                newSocket.soTimeout = 1200
+
+                socket = newSocket
+                targetAddress = address
+
+                sendInternal("HELLO,DRAWTUNE,1")
+
+                val buffer = ByteArray(256)
+                val packet = DatagramPacket(buffer, buffer.size)
+
+                try {
+                    newSocket.receive(packet)
+                    val response = String(
+                        packet.data,
+                        0,
+                        packet.length,
+                        Charsets.UTF_8
+                    ).trim()
+
+                    if (response.startsWith("READY")) {
+                        connected = true
+                        mainHandler.post {
+                            onResult(true, "ESP32 connected")
+                        }
+                    } else {
+                        disconnect()
+                        mainHandler.post {
+                            onResult(false, "ESP32 replied: $response")
+                        }
+                    }
+                } catch (_: SocketTimeoutException) {
+                    disconnect()
+                    mainHandler.post {
+                        onResult(
+                            false,
+                            "No ESP32 response. Check Wi-Fi and IP."
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                disconnect()
+                mainHandler.post {
+                    onResult(
+                        false,
+                        "Connection failed: ${e.message ?: "unknown error"}"
+                    )
+                }
+            }
+        }.start()
+    }
+
+    private fun sendInternal(message: String) {
+        val currentSocket = socket ?: return
+        val address = targetAddress ?: return
+
+        val data = message.toByteArray(Charsets.UTF_8)
+        val packet = DatagramPacket(
+            data,
+            data.size,
+            address,
+            DEFAULT_PORT
+        )
+
+        currentSocket.send(packet)
+    }
+
+    fun send(message: String) {
+        if (!connected) return
+
+        sendExecutor.execute {
+            try {
+                if (connected) {
+                    sendInternal(message)
+                }
+            } catch (_: Exception) {
+                connected = false
+            }
+        }
+    }
+
+    fun disconnect() {
+        connected = false
+        try {
+            socket?.close()
+        } catch (_: Exception) {
+        }
+        socket = null
+        targetAddress = null
+    }
+
+    fun shutdown() {
+        disconnect()
+        sendExecutor.shutdownNow()
+    }
+}
 
 
 // ============================================================
@@ -279,61 +425,42 @@ private fun saveSavedTunes(
 class DrawTuneAudioEngine {
 
     private val sampleRate = 44100
-
     private var audioTrack: AudioTrack? = null
-
-    private var currentFrequency = 261.63
-
+    private var currentFrequency = 261.625565
     private var currentInstrument = "Piano"
-
     private var isPlaying = false
-
     private var audioThread: Thread? = null
-
     private val lock = Any()
-
-
-    // ========================================================
-    // START AUDIO
-    // ========================================================
+    private var noteStartNanos = System.nanoTime()
+    private var releaseNanos = 0L
+    private var noteGate = false
+    private var phase = 0.0
+    private var noiseState = 0x12345678L
 
     fun start() {
-
-        if (isPlaying) {
-            return
+        synchronized(lock) {
+            noteGate = true
+            noteStartNanos = System.nanoTime()
+            releaseNanos = 0L
         }
+
+        if (isPlaying) return
 
         val minBufferSize = AudioTrack.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-
-        val bufferSize = maxOf(
-            minBufferSize,
-            2048
-        )
-
-        val attributes =
-            AudioAttributes.Builder()
-                .setUsage(
-                    AudioAttributes.USAGE_MEDIA
-                )
-                .setContentType(
-                    AudioAttributes.CONTENT_TYPE_MUSIC
-                )
-                .build()
-
-        val format =
-            AudioFormat.Builder()
-                .setSampleRate(sampleRate)
-                .setEncoding(
-                    AudioFormat.ENCODING_PCM_16BIT
-                )
-                .setChannelMask(
-                    AudioFormat.CHANNEL_OUT_MONO
-                )
-                .build()
+        val bufferSize = maxOf(minBufferSize, 4096)
+        val attributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build()
+        val format = AudioFormat.Builder()
+            .setSampleRate(sampleRate)
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+            .build()
 
         audioTrack = AudioTrack(
             attributes,
@@ -344,192 +471,212 @@ class DrawTuneAudioEngine {
         )
 
         isPlaying = true
-
         audioTrack?.play()
 
         audioThread = Thread {
-
             val buffer = ShortArray(1024)
-
-            var phase = 0.0
-
-            var noiseSeed = 123456789L
-
             while (isPlaying) {
-
                 val frequency: Double
                 val instrument: String
+                val startNanos: Long
+                val gate: Boolean
+                val releaseTime: Long
 
                 synchronized(lock) {
                     frequency = currentFrequency
                     instrument = currentInstrument
+                    startNanos = noteStartNanos
+                    gate = noteGate
+                    releaseTime = releaseNanos
                 }
-
-                val phaseIncrement =
-                    2.0 * PI * frequency / sampleRate
 
                 for (i in buffer.indices) {
+                    val now = System.nanoTime()
+                    val t = ((now - startNanos).coerceAtLeast(0L)) / 1_000_000_000.0
+                    val phaseIncrement = 2.0 * PI * frequency / sampleRate
 
-                    val basicWave =
-                        sin(phase)
+                    val releaseEnv = if (!gate && releaseTime > 0L) {
+                        val r = ((now - releaseTime).coerceAtLeast(0L)) / 1_000_000_000.0
+                        exp(-r / releaseTimeConstant(instrument))
+                    } else if (!gate) {
+                        0.0
+                    } else {
+                        1.0
+                    }
 
-                    val sample =
-                        when (instrument) {
+                    val sample = when (instrument) {
+                        "Piano" -> pianoSample(phase, t) * releaseEnv
+                        "Guitar" -> guitarSample(phase, t) * releaseEnv
+                        "Violin" -> violinSample(phase, t) * releaseEnv
+                        "Synth" -> synthSample(phase, t) * releaseEnv
+                        "Drum" -> drumSample(phase, t, frequency) * releaseEnv
+                        else -> sin(phase) * 0.18 * releaseEnv
+                    }
 
-                            "Piano" -> {
-                                (
-                                        0.75 * sin(phase) +
-                                                0.18 * sin(phase * 2.0) +
-                                                0.07 * sin(phase * 3.0)
-                                        ) * 0.25
-                            }
-
-                            "Synth" -> {
-                                (
-                                        0.55 * sin(phase) +
-                                                0.25 * sin(phase * 2.0) +
-                                                0.15 * sin(phase * 3.0) +
-                                                0.05 * sin(phase * 5.0)
-                                        ) * 0.28
-                            }
-
-                            "Guitar" -> {
-                                (
-                                        0.80 * sin(phase) +
-                                                0.12 * sin(phase * 2.0) +
-                                                0.08 * sin(phase * 3.0)
-                                        ) * 0.25
-                            }
-
-                            "Violin" -> {
-                                (
-                                        0.55 * sin(phase) +
-                                                0.25 * sin(phase * 2.0) +
-                                                0.12 * sin(phase * 3.0) +
-                                                0.08 * sin(phase * 4.0)
-                                        ) * 0.25
-                            }
-
-                            "Drum" -> {
-
-                                noiseSeed =
-                                    noiseSeed
-                                        .shl(13)
-                                        .xor(noiseSeed)
-
-                                noiseSeed =
-                                    noiseSeed
-                                        .shr(17)
-                                        .xor(noiseSeed)
-
-                                noiseSeed =
-                                    noiseSeed
-                                        .shl(5)
-                                        .xor(noiseSeed)
-
-                                val noise =
-                                    (
-                                            noiseSeed and 0xFFFF
-                                            ) / 32768.0 - 1.0
-
-                                noise * 0.30
-                            }
-
-                            else -> {
-                                basicWave * 0.25
-                            }
-                        }
-
-                    buffer[i] =
-                        (
-                                sample * Short.MAX_VALUE
-                                )
-                            .toInt()
-                            .coerceIn(
-                                Short.MIN_VALUE.toInt(),
-                                Short.MAX_VALUE.toInt()
-                            )
-                            .toShort()
+                    buffer[i] = (sample * Short.MAX_VALUE)
+                        .toInt()
+                        .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                        .toShort()
 
                     phase += phaseIncrement
-
-                    if (phase >= 2.0 * PI) {
-                        phase -= 2.0 * PI
-                    }
+                    while (phase >= 2.0 * PI) phase -= 2.0 * PI
                 }
 
-                audioTrack?.write(
-                    buffer,
-                    0,
-                    buffer.size
-                )
+                audioTrack?.write(buffer, 0, buffer.size)
+
+                if (!gate && releaseTime > 0L) {
+                    val releasedFor = (System.nanoTime() - releaseTime) / 1_000_000L
+                    if (releasedFor > releaseDurationMs(instrument)) {
+                        stopTrackOnly()
+                    }
+                }
             }
         }
-
         audioThread?.start()
     }
 
+    private fun releaseTimeConstant(instrument: String): Double = when (instrument) {
+        "Piano" -> 0.22
+        "Guitar" -> 0.18
+        "Violin" -> 0.16
+        "Synth" -> 0.10
+        "Drum" -> 0.035
+        else -> 0.10
+    }
 
-    // ========================================================
-    // SET NOTE
-    // ========================================================
+    private fun releaseDurationMs(instrument: String): Long = when (instrument) {
+        "Piano" -> 900L
+        "Guitar" -> 700L
+        "Violin" -> 500L
+        "Synth" -> 350L
+        "Drum" -> 180L
+        else -> 300L
+    }
+
+    private fun pianoSample(p: Double, t: Double): Double {
+        val attack = 1.0 - exp(-t / 0.0025)
+        val decay = exp(-t / 2.0)
+        val highDecay = exp(-t / 0.16)
+        val body =
+            0.86 * sin(p) +
+                    0.46 * sin(p * 2.01) +
+                    0.27 * sin(p * 3.01) +
+                    0.18 * sin(p * 4.02) +
+                    0.12 * sin(p * 5.03) +
+                    0.08 * sin(p * 6.05) +
+                    0.055 * sin(p * 7.07)
+        val hammer = highDecay * (
+                0.10 * sin(p * 8.0) +
+                        0.07 * sin(p * 10.0) +
+                        0.04 * sin(p * 12.0)
+                )
+        return (attack * decay * body + attack * hammer) * 0.13
+    }
+
+    private fun guitarSample(p: Double, t: Double): Double {
+        val attack = 1.0 - exp(-t / 0.0015)
+        val decay = exp(-t / 2.4)
+        val brightness = exp(-t / 0.10)
+        val pluck =
+            0.72 * sin(p) +
+                    0.26 * sin(p * 2.0) +
+                    0.16 * sin(p * 3.0) +
+                    0.11 * sin(p * 4.0) +
+                    0.08 * sin(p * 5.0)
+        val pick = brightness * (
+                0.16 * sin(p * 6.0) +
+                        0.10 * sin(p * 8.0) +
+                        0.06 * sin(p * 9.0)
+                )
+        return (attack * decay * pluck + pick) * 0.18
+    }
+
+    private fun violinSample(p: Double, t: Double): Double {
+        val attack = 1.0 - exp(-t / 0.11)
+        val bowPulse = 0.94 + 0.06 * sin(2.0 * PI * 7.0 * t)
+        val vibratoRatio = 1.0 + 0.0048 * sin(2.0 * PI * 5.3 * t)
+        val vp = p * vibratoRatio
+        val body =
+            0.62 * sin(vp) +
+                    0.40 * sin(vp * 2.0) +
+                    0.30 * sin(vp * 3.0) +
+                    0.22 * sin(vp * 4.0) +
+                    0.16 * sin(vp * 5.0) +
+                    0.11 * sin(vp * 6.0) +
+                    0.07 * sin(vp * 7.0)
+        return attack * bowPulse * body * 0.12
+    }
+
+    private fun synthSample(p: Double, t: Double): Double {
+        val cycle = (p / (2.0 * PI)) - floor(p / (2.0 * PI))
+        val saw = 2.0 * cycle - 1.0
+        val sub = sin(p * 0.5)
+        val pulse = if (cycle < 0.42) 1.0 else -1.0
+        val env = 0.85 + 0.15 * exp(-t / 0.08)
+        return (0.48 * saw + 0.25 * sub + 0.15 * pulse +
+                0.10 * sin(p * 2.0) + 0.06 * sin(p * 3.0)) * 0.16 * env
+    }
+
+    private fun nextNoise(): Double {
+        noiseState = noiseState xor (noiseState shl 13)
+        noiseState = noiseState xor (noiseState shr 17)
+        noiseState = noiseState xor (noiseState shl 5)
+        return (noiseState and 0xFFFFL) / 32768.0 - 1.0
+    }
+
+    private fun drumSample(p: Double, t: Double, frequency: Double): Double {
+        val kickFrequency = (frequency * 1.8).coerceIn(55.0, 180.0)
+        val kickPhase = 2.0 * PI * kickFrequency * t
+        val sweep = 2.0 * PI * (kickFrequency + 90.0 * exp(-t / 0.035)) * t
+        val kick = exp(-t / 0.18) * sin(sweep) * 0.52
+        val click = exp(-t / 0.012) * nextNoise() * 0.34
+        val snare = exp(-t / 0.07) * nextNoise() * 0.22
+        val hat = exp(-t / 0.025) * nextNoise() * 0.12
+        return kick + click + snare + hat + sin(kickPhase) * exp(-t / 0.12) * 0.08
+    }
 
     fun setNote(note: String) {
-
-        val frequency =
-            frequencyFromNote(note)
-
+        val frequency = frequencyFromNote(note)
         synchronized(lock) {
             currentFrequency = frequency
+            noteStartNanos = System.nanoTime()
+            releaseNanos = 0L
+            noteGate = true
+            phase = 0.0
         }
     }
-
-
-    // ========================================================
-    // SET INSTRUMENT
-    // ========================================================
 
     fun setInstrument(instrument: String) {
+        synchronized(lock) { currentInstrument = instrument }
+    }
 
+    fun releaseNote() {
         synchronized(lock) {
-            currentInstrument = instrument
+            if (noteGate) {
+                noteGate = false
+                releaseNanos = System.nanoTime()
+            }
         }
     }
 
-
-    // ========================================================
-    // STOP AUDIO
-    // ========================================================
+    private fun stopTrackOnly() {
+        isPlaying = false
+    }
 
     fun stop() {
-
+        synchronized(lock) {
+            noteGate = false
+            releaseNanos = 0L
+        }
         isPlaying = false
-
-        try {
-            audioThread?.join(100)
-        } catch (_: InterruptedException) {
-        }
-
+        try { audioThread?.join(120) } catch (_: InterruptedException) {}
         audioThread = null
-
-        try {
-            audioTrack?.stop()
-        } catch (_: Exception) {
-        }
-
+        try { audioTrack?.stop() } catch (_: Exception) {}
         audioTrack?.release()
-
         audioTrack = null
     }
 
-
-    // ========================================================
-    // RELEASE
-    // ========================================================
-
-    fun release() {
-        stop()
-    }
+    fun release() { stop() }
 }
 
 
@@ -541,6 +688,26 @@ class DrawTuneAudioEngine {
 fun DrawTuneApp(
     audioEngine: DrawTuneAudioEngine
 ) {
+
+    val wifiManager = remember { DrawTuneWifiManager() }
+
+    var wifiIpAddress by remember {
+        mutableStateOf("192.168.4.1")
+    }
+
+    var wifiConnected by remember {
+        mutableStateOf(false)
+    }
+
+    var wifiStatus by remember {
+        mutableStateOf("ESP32 disconnected")
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            wifiManager.shutdown()
+        }
+    }
 
     val context = LocalContext.current
 
@@ -601,6 +768,14 @@ fun DrawTuneApp(
     }
 
     // ========================================================
+    // CREATE MODE TAB
+    // ========================================================
+
+    var createMode by remember {
+        mutableStateOf(0) // 0 = Draw, 1 = Virtual Instrument
+    }
+
+    // ========================================================
     // RECORDING STATE
     // ========================================================
 
@@ -651,6 +826,13 @@ fun DrawTuneApp(
         mutableStateOf(440)
     }
 
+    fun sendEsp32Config() {
+        wifiManager.send(
+            "CONFIG,$selectedInstrument,$selectedKey,$selectedScale," +
+                    "$selectedOctave,$tempo,$tuning"
+        )
+    }
+
 
     // ========================================================
     // SETTINGS DIALOG
@@ -681,6 +863,30 @@ fun DrawTuneApp(
         selectedOctave
     )
 
+    val latestTempo by rememberUpdatedState(
+        tempo
+    )
+
+    val latestTuning by rememberUpdatedState(
+        tuning
+    )
+
+    // Send the complete current configuration whenever a setting or
+    // the ESP32 connection state changes.
+    LaunchedEffect(
+        selectedInstrument,
+        selectedKey,
+        selectedScale,
+        selectedOctave,
+        tempo,
+        tuning,
+        wifiConnected
+    ) {
+        if (wifiConnected) {
+            sendEsp32Config()
+        }
+    }
+
 
     // ========================================================
     // PLAYBACK
@@ -702,6 +908,8 @@ fun DrawTuneApp(
         audioEngine.setInstrument(
             selectedInstrument
         )
+
+        sendEsp32Config()
 
         var previousStartTime = 0L
 
@@ -745,6 +953,10 @@ fun DrawTuneApp(
                 recordedNote.note
             )
 
+            wifiManager.send(
+                "NOTE_START,${recordedNote.note}"
+            )
+
             audioEngine.start()
 
             val tempoFactor =
@@ -758,6 +970,9 @@ fun DrawTuneApp(
                     .coerceAtLeast(50L)
 
             delay(adjustedDuration)
+            wifiManager.send(
+                "NOTE_END,${recordedNote.note},${adjustedDuration}"
+            )
 
             previousStartTime =
                 recordedNote.startTime +
@@ -769,6 +984,80 @@ fun DrawTuneApp(
         isPlayingTune = false
     }
 
+
+    // ========================================================
+    // VIRTUAL INSTRUMENT HELPERS
+    // ========================================================
+
+    fun startVirtualNote(note: String) {
+        if (isPlayingTune) return
+
+        // Finish any currently held virtual key before starting another.
+        if (currentRecordedNote != null) {
+            val now = System.currentTimeMillis()
+            val duration =
+                (now - currentNoteStartTime).coerceAtLeast(50L)
+            val relativeStart =
+                (currentNoteStartTime - recordingStartTime).coerceAtLeast(0L) +
+                        recordingBaseOffset
+
+            recordedNotes.add(
+                RecordedNote(
+                    note = currentRecordedNote!!,
+                    startTime = relativeStart,
+                    duration = duration
+                )
+            )
+            audioEngine.stop()
+            currentRecordedNote = null
+        }
+
+        val now = System.currentTimeMillis()
+        if (recordingStartTime == 0L) {
+            recordingStartTime = now
+        }
+
+        currentRecordedNote = note
+        currentNoteStartTime = now
+        currentNote = note
+
+        audioEngine.setInstrument(selectedInstrument)
+        audioEngine.setNote(note)
+        audioEngine.start()
+
+        wifiManager.send(
+            "CONFIG,$selectedInstrument,$selectedKey,$selectedScale," +
+                    "$selectedOctave,$tempo,$tuning"
+        )
+        wifiManager.send("NOTE_START,$note")
+    }
+
+    fun endVirtualNote(note: String) {
+        if (currentRecordedNote != note) return
+
+        val now = System.currentTimeMillis()
+        val duration =
+            (now - currentNoteStartTime).coerceAtLeast(50L)
+        val relativeStart =
+            (currentNoteStartTime - recordingStartTime).coerceAtLeast(0L) +
+                    recordingBaseOffset
+
+        recordedNotes.add(
+            RecordedNote(
+                note = note,
+                startTime = relativeStart,
+                duration = duration
+            )
+        )
+
+        wifiManager.send(
+            "NOTE_END,$note,$duration"
+        )
+
+        currentRecordedNote = null
+        currentNoteStartTime = 0L
+        audioEngine.releaseNote()
+    }
 
     // ========================================================
     // MAIN SURFACE
@@ -917,7 +1206,100 @@ fun DrawTuneApp(
                 }
 
                 Spacer(
-                    modifier = Modifier.height(16.dp)
+                    modifier = Modifier.height(12.dp)
+                )
+
+                // ========================================================
+                // ESP32 WI-FI CONNECTION
+                // ========================================================
+
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (wifiConnected) {
+                            Color(0xFFE8F5E9)
+                        } else {
+                            Color.White
+                        }
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(
+                                    text = if (wifiConnected) {
+                                        "🟢 ESP32 CONNECTED"
+                                    } else {
+                                        "🔴 ESP32 DISCONNECTED"
+                                    },
+                                    fontWeight = FontWeight.Bold
+                                )
+
+                                Text(
+                                    text = wifiStatus,
+                                    fontSize = 12.sp,
+                                    color = Color.Gray
+                                )
+                            }
+
+                            Button(
+                                onClick = {
+                                    if (wifiConnected) {
+                                        wifiManager.disconnect()
+                                        wifiConnected = false
+                                        wifiStatus = "ESP32 disconnected"
+                                    } else {
+                                        wifiStatus = "Connecting..."
+                                        wifiManager.connect(
+                                            wifiIpAddress
+                                        ) { success, message ->
+                                            wifiConnected = success
+                                            wifiStatus = message
+                                            if (success) {
+                                                sendEsp32Config()
+                                            }
+                                        }
+                                    }
+                                }
+                            ) {
+                                Text(
+                                    if (wifiConnected) {
+                                        "DISCONNECT"
+                                    } else {
+                                        "CONNECT"
+                                    }
+                                )
+                            }
+                        }
+
+                        Spacer(
+                            modifier = Modifier.height(8.dp)
+                        )
+
+                        OutlinedTextField(
+                            value = wifiIpAddress,
+                            onValueChange = { wifiIpAddress = it },
+                            label = { Text("ESP32 IP address") },
+                            singleLine = true,
+                            enabled = !wifiConnected,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+
+                Spacer(
+                    modifier = Modifier.height(12.dp)
                 )
 
 
@@ -1126,335 +1508,395 @@ fun DrawTuneApp(
 
 
                 // ========================================================
-                // CANVAS LABEL
+                // CREATE MODE TABS
                 // ========================================================
 
-                Text(
-                    text = "DRAWING CANVAS",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.Gray
-                )
+                TabRow(
+                    selectedTabIndex = createMode,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Tab(
+                        selected = createMode == 0,
+                        onClick = {
+                            if (!isPlayingTune) {
+                                audioEngine.stop()
+                                currentRecordedNote = null
+                                createMode = 0
+                            }
+                        },
+                        text = { Text("DRAW") }
+                    )
+
+                    Tab(
+                        selected = createMode == 1,
+                        onClick = {
+                            if (!isPlayingTune) {
+                                audioEngine.stop()
+                                currentRecordedNote = null
+                                createMode = 1
+                            }
+                        },
+                        text = { Text("INSTRUMENT") }
+                    )
+                }
 
                 Spacer(
-                    modifier = Modifier.height(6.dp)
+                    modifier = Modifier.height(8.dp)
                 )
 
+                if (createMode == 0) {
 
-                // ========================================================
-                // DRAWING CANVAS
-                // ========================================================
+                    // ========================================================
+                    // DRAWING CANVAS
+                    // ========================================================
 
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .background(
-                            Color.White,
-                            RoundedCornerShape(18.dp)
-                        )
-                ) {
-
-                    Canvas(
+                    Box(
                         modifier = Modifier
-                            .fillMaxSize()
-                            .padding(4.dp)
-                            .pointerInput(Unit) {
-
-                                awaitEachGesture {
-                                    val down = awaitFirstDown(
-                                        requireUnconsumed = false
-                                    )
-
-                                    if (isPlayingTune) {
-                                        return@awaitEachGesture
-                                    }
-
-                                    isDrawing = true
-
-                                    val clampedX =
-                                        down.position.x.coerceIn(
-                                            0f,
-                                            size.width.toFloat()
-                                        )
-
-                                    val clampedY =
-                                        down.position.y.coerceIn(
-                                            0f,
-                                            size.height.toFloat()
-                                        )
-
-                                    val clampedPosition =
-                                        Offset(clampedX, clampedY)
-
-                                    val stroke = DrawingStroke()
-                                    stroke.points.add(clampedPosition)
-                                    strokes.add(stroke)
-
-                                    val note =
-                                        noteFromPosition(
-                                            x = clampedX,
-                                            canvasWidth = size.width.toFloat(),
-                                            key = latestKey,
-                                            scale = latestScale,
-                                            octave = latestOctave
-                                        )
-
-                                    currentNote = note
-
-                                    val now = System.currentTimeMillis()
-                                    if (recordingStartTime == 0L) {
-                                        recordingStartTime = now
-                                    }
-
-                                    currentRecordedNote = note
-                                    currentNoteStartTime = now
-
-                                    audioEngine.setInstrument(latestInstrument)
-                                    audioEngine.setNote(note)
-                                    audioEngine.start()
-
-                                    var finished = false
-
-                                    try {
-                                        while (!finished) {
-                                            val event = awaitPointerEvent()
-                                            val change =
-                                                event.changes.firstOrNull {
-                                                    it.id == down.id
-                                                } ?: break
-
-                                            if (!change.pressed) {
-                                                val releaseNow =
-                                                    System.currentTimeMillis()
-
-                                                if (currentRecordedNote != null) {
-                                                    val duration =
-                                                        (releaseNow - currentNoteStartTime)
-                                                            .coerceAtLeast(50L)
-
-                                                    val relativeStart =
-                                                        (currentNoteStartTime - recordingStartTime)
-                                                            .coerceAtLeast(0L)
-
-                                                    recordedNotes.add(
-                                                        RecordedNote(
-                                                            note = currentRecordedNote!!,
-                                                            startTime = relativeStart,
-                                                            duration = duration
-                                                        )
-                                                    )
-                                                }
-
-                                                currentRecordedNote = null
-                                                isDrawing = false
-                                                audioEngine.stop()
-                                                finished = true
-                                            } else {
-                                                change.consume()
-
-                                                val clampedMoveX =
-                                                    change.position.x.coerceIn(
-                                                        0f,
-                                                        size.width.toFloat()
-                                                    )
-
-                                                val clampedMoveY =
-                                                    change.position.y.coerceIn(
-                                                        0f,
-                                                        size.height.toFloat()
-                                                    )
-
-                                                val movePosition =
-                                                    Offset(clampedMoveX, clampedMoveY)
-
-                                                strokes.lastOrNull()?.points?.add(movePosition)
-
-                                                val movedNote =
-                                                    noteFromPosition(
-                                                        x = clampedMoveX,
-                                                        canvasWidth = size.width.toFloat(),
-                                                        key = latestKey,
-                                                        scale = latestScale,
-                                                        octave = latestOctave
-                                                    )
-
-                                                currentNote = movedNote
-                                                audioEngine.setNote(movedNote)
-                                                audioEngine.setInstrument(latestInstrument)
-
-                                                if (
-                                                    currentRecordedNote != null &&
-                                                    movedNote != currentRecordedNote
-                                                ) {
-                                                    val noteNow = System.currentTimeMillis()
-                                                    val duration =
-                                                        (noteNow - currentNoteStartTime)
-                                                            .coerceAtLeast(20L)
-                                                    val relativeStart =
-                                                        (currentNoteStartTime - recordingStartTime)
-                                                            .coerceAtLeast(0L)
-
-                                                    recordedNotes.add(
-                                                        RecordedNote(
-                                                            note = currentRecordedNote!!,
-                                                            startTime = relativeStart,
-                                                            duration = duration
-                                                        )
-                                                    )
-
-                                                    currentRecordedNote = movedNote
-                                                    currentNoteStartTime = noteNow
-                                                }
-                                            }
-                                        }
-                                    } catch (_: CancellationException) {
-                                        currentRecordedNote = null
-                                        isDrawing = false
-                                        audioEngine.stop()
-                                    }
-                                }
-                            }
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .background(
+                                Color.White,
+                                RoundedCornerShape(18.dp)
+                            )
                     ) {
 
+                        Canvas(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(4.dp)
+                                .pointerInput(Unit) {
 
-                        // ====================================================
-                        // MUSICAL GUIDE LINES
-                        // ====================================================
+                                    awaitEachGesture {
+                                        val down = awaitFirstDown(
+                                            requireUnconsumed = false
+                                        )
 
-                        val guideLines = 8
+                                        if (isPlayingTune) {
+                                            return@awaitEachGesture
+                                        }
 
-                        for (i in 0..guideLines) {
+                                        isDrawing = true
 
-                            val y =
-                                size.height *
-                                        i.toFloat() /
-                                        guideLines.toFloat()
+                                        val clampedX =
+                                            down.position.x.coerceIn(
+                                                0f,
+                                                size.width.toFloat()
+                                            )
 
-                            drawLine(
-                                color =
-                                    Color(0xFFE8E8ED),
+                                        val clampedY =
+                                            down.position.y.coerceIn(
+                                                0f,
+                                                size.height.toFloat()
+                                            )
 
-                                start =
-                                    Offset(
-                                        0f,
-                                        y
-                                    ),
+                                        val clampedPosition =
+                                            Offset(clampedX, clampedY)
 
-                                end =
-                                    Offset(
-                                        size.width,
-                                        y
-                                    ),
+                                        val stroke = DrawingStroke()
+                                        stroke.points.add(clampedPosition)
+                                        strokes.add(stroke)
 
-                                strokeWidth = 1f
-                            )
-                        }
+                                        val note =
+                                            noteFromPosition(
+                                                x = clampedX,
+                                                canvasWidth = size.width.toFloat(),
+                                                key = latestKey,
+                                                scale = latestScale,
+                                                octave = latestOctave
+                                            )
+
+                                        currentNote = note
+
+                                        val now = System.currentTimeMillis()
+                                        if (recordingStartTime == 0L) {
+                                            recordingStartTime = now
+                                        }
+
+                                        currentRecordedNote = note
+                                        currentNoteStartTime = now
+
+                                        audioEngine.setInstrument(latestInstrument)
+                                        audioEngine.setNote(note)
+                                        audioEngine.start()
+
+                                        wifiManager.send(
+                                            "CONFIG,$latestInstrument,$latestKey,$latestScale," +
+                                                    "$latestOctave,$latestTempo,$latestTuning"
+                                        )
+                                        wifiManager.send(
+                                            "NOTE_START,$note"
+                                        )
+
+                                        var finished = false
+
+                                        try {
+                                            while (!finished) {
+                                                val event = awaitPointerEvent()
+                                                val change =
+                                                    event.changes.firstOrNull {
+                                                        it.id == down.id
+                                                    } ?: break
+
+                                                if (!change.pressed) {
+                                                    val releaseNow =
+                                                        System.currentTimeMillis()
+
+                                                    if (currentRecordedNote != null) {
+                                                        val duration =
+                                                            (releaseNow - currentNoteStartTime)
+                                                                .coerceAtLeast(50L)
+
+                                                        val relativeStart =
+                                                            (currentNoteStartTime - recordingStartTime)
+                                                                .coerceAtLeast(0L)
+
+                                                        recordedNotes.add(
+                                                            RecordedNote(
+                                                                note = currentRecordedNote!!,
+                                                                startTime = relativeStart,
+                                                                duration = duration
+                                                            )
+                                                        )
+                                                    }
+
+                                                    wifiManager.send(
+                                                        "NOTE_END,${currentRecordedNote ?: note},${(releaseNow - currentNoteStartTime).coerceAtLeast(50L)}"
+                                                    )
+
+                                                    currentRecordedNote = null
+                                                    isDrawing = false
+                                                    audioEngine.releaseNote()
+                                                    finished = true
+                                                } else {
+                                                    change.consume()
+
+                                                    val clampedMoveX =
+                                                        change.position.x.coerceIn(
+                                                            0f,
+                                                            size.width.toFloat()
+                                                        )
+
+                                                    val clampedMoveY =
+                                                        change.position.y.coerceIn(
+                                                            0f,
+                                                            size.height.toFloat()
+                                                        )
+
+                                                    val movePosition =
+                                                        Offset(clampedMoveX, clampedMoveY)
+
+                                                    strokes.lastOrNull()?.points?.add(movePosition)
+
+                                                    val movedNote =
+                                                        noteFromPosition(
+                                                            x = clampedMoveX,
+                                                            canvasWidth = size.width.toFloat(),
+                                                            key = latestKey,
+                                                            scale = latestScale,
+                                                            octave = latestOctave
+                                                        )
+
+                                                    currentNote = movedNote
+                                                    audioEngine.setNote(movedNote)
+                                                    audioEngine.setInstrument(latestInstrument)
+
+                                                    if (
+                                                        currentRecordedNote != null &&
+                                                        movedNote != currentRecordedNote
+                                                    ) {
+                                                        val noteNow = System.currentTimeMillis()
+                                                        val duration =
+                                                            (noteNow - currentNoteStartTime)
+                                                                .coerceAtLeast(20L)
+                                                        val relativeStart =
+                                                            (currentNoteStartTime - recordingStartTime)
+                                                                .coerceAtLeast(0L)
+
+                                                        wifiManager.send(
+                                                            "NOTE_CHANGE,$movedNote"
+                                                        )
+
+                                                        recordedNotes.add(
+                                                            RecordedNote(
+                                                                note = currentRecordedNote!!,
+                                                                startTime = relativeStart,
+                                                                duration = duration
+                                                            )
+                                                        )
+
+                                                        currentRecordedNote = movedNote
+                                                        currentNoteStartTime = noteNow
+                                                    }
+                                                }
+                                            }
+                                        } catch (_: CancellationException) {
+                                            currentRecordedNote = null
+                                            isDrawing = false
+                                            audioEngine.stop()
+                                        }
+                                    }
+                                }
+                        ) {
 
 
-                        // ====================================================
-                        // DRAW USER STROKES
-                        // ====================================================
+                            // ====================================================
+                            // MUSICAL GUIDE LINES
+                            // ====================================================
 
-                        for (stroke in strokes) {
+                            val guideLines = 8
 
-                            if (stroke.points.isEmpty()) {
-                                continue
+                            for (i in 0..guideLines) {
+
+                                val y =
+                                    size.height *
+                                            i.toFloat() /
+                                            guideLines.toFloat()
+
+                                drawLine(
+                                    color =
+                                        Color(0xFFE8E8ED),
+
+                                    start =
+                                        Offset(
+                                            0f,
+                                            y
+                                        ),
+
+                                    end =
+                                        Offset(
+                                            size.width,
+                                            y
+                                        ),
+
+                                    strokeWidth = 1f
+                                )
                             }
 
 
-                            // ----------------------------------------------
-                            // SINGLE POINT
-                            // ----------------------------------------------
+                            // ====================================================
+                            // DRAW USER STROKES
+                            // ====================================================
 
-                            if (stroke.points.size == 1) {
+                            for (stroke in strokes) {
 
-                                drawCircle(
+                                if (stroke.points.isEmpty()) {
+                                    continue
+                                }
+
+
+                                // ----------------------------------------------
+                                // SINGLE POINT
+                                // ----------------------------------------------
+
+                                if (stroke.points.size == 1) {
+
+                                    drawCircle(
+                                        color =
+                                            Color(0xFF6750A4),
+
+                                        radius = 4f,
+
+                                        center =
+                                            stroke.points[0]
+                                    )
+
+                                    continue
+                                }
+
+
+                                // ----------------------------------------------
+                                // CREATE PATH
+                                // ----------------------------------------------
+
+                                val path =
+                                    Path()
+
+                                path.moveTo(
+                                    stroke.points[0].x,
+                                    stroke.points[0].y
+                                )
+
+                                for (
+                                i in 1 until stroke.points.size
+                                ) {
+
+                                    path.lineTo(
+                                        stroke.points[i].x,
+                                        stroke.points[i].y
+                                    )
+                                }
+
+
+                                // ----------------------------------------------
+                                // DRAW PATH
+                                // ----------------------------------------------
+
+                                drawPath(
+                                    path = path,
+
                                     color =
                                         Color(0xFF6750A4),
 
-                                    radius = 4f,
+                                    style =
+                                        Stroke(
+                                            width = 6f,
 
-                                    center =
-                                        stroke.points[0]
-                                )
+                                            cap =
+                                                StrokeCap.Round,
 
-                                continue
-                            }
-
-
-                            // ----------------------------------------------
-                            // CREATE PATH
-                            // ----------------------------------------------
-
-                            val path =
-                                Path()
-
-                            path.moveTo(
-                                stroke.points[0].x,
-                                stroke.points[0].y
-                            )
-
-                            for (
-                            i in 1 until stroke.points.size
-                            ) {
-
-                                path.lineTo(
-                                    stroke.points[i].x,
-                                    stroke.points[i].y
+                                            join =
+                                                StrokeJoin.Round
+                                        )
                                 )
                             }
+                        }
 
 
-                            // ----------------------------------------------
-                            // DRAW PATH
-                            // ----------------------------------------------
+                        // ========================================================
+                        // EMPTY CANVAS MESSAGE
+                        // ========================================================
 
-                            drawPath(
-                                path = path,
+                        if (
+                            !isDrawing &&
+                            strokes.isEmpty()
+                        ) {
+
+                            Text(
+                                text =
+                                    "Touch and draw here",
+
+                                modifier =
+                                    Modifier.align(
+                                        Alignment.Center
+                                    ),
 
                                 color =
-                                    Color(0xFF6750A4),
+                                    Color.LightGray,
 
-                                style =
-                                    Stroke(
-                                        width = 6f,
-
-                                        cap =
-                                            StrokeCap.Round,
-
-                                        join =
-                                            StrokeJoin.Round
-                                    )
+                                fontSize = 17.sp
                             )
                         }
                     }
-
+                } else {
 
                     // ========================================================
-                    // EMPTY CANVAS MESSAGE
+                    // VIRTUAL INSTRUMENT
                     // ========================================================
 
-                    if (
-                        !isDrawing &&
-                        strokes.isEmpty()
-                    ) {
-
-                        Text(
-                            text =
-                                "Touch and draw here",
-
-                            modifier =
-                                Modifier.align(
-                                    Alignment.Center
-                                ),
-
-                            color =
-                                Color.LightGray,
-
-                            fontSize = 17.sp
-                        )
-                    }
+                    VirtualInstrument(
+                        instrument = selectedInstrument,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        enabled = !isPlayingTune,
+                        currentNote = currentNote,
+                        onNoteStart = { note ->
+                            startVirtualNote(note)
+                        },
+                        onNoteEnd = { note ->
+                            endVirtualNote(note)
+                        }
+                    )
                 }
 
 
@@ -1978,6 +2420,7 @@ fun DrawTuneApp(
                                 )
                                 .toIntOrNull()
                                 ?: 440
+                        sendEsp32Config()
 
                         activeSetting =
                             null
@@ -1995,6 +2438,348 @@ fun DrawTuneApp(
 
 
 
+}
+
+
+// ============================================================
+// VIRTUAL INSTRUMENTS
+// ============================================================
+
+@Composable
+fun VirtualInstrument(
+    instrument: String,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    currentNote: String,
+    onNoteStart: (String) -> Unit,
+    onNoteEnd: (String) -> Unit
+) {
+    when (instrument) {
+        "Piano" -> VirtualPiano(modifier, enabled, currentNote, onNoteStart, onNoteEnd)
+        "Synth" -> VirtualSynth(modifier, enabled, currentNote, onNoteStart, onNoteEnd)
+        "Guitar" -> VirtualGuitar(modifier, enabled, currentNote, onNoteStart, onNoteEnd)
+        "Violin" -> VirtualViolin(modifier, enabled, currentNote, onNoteStart, onNoteEnd)
+        "Drum" -> VirtualDrumKit(modifier, enabled, currentNote, onNoteStart, onNoteEnd)
+        else -> VirtualPiano(modifier, enabled, currentNote, onNoteStart, onNoteEnd)
+    }
+}
+
+private val instrumentAccent = Color(0xFF6750A4)
+
+@Composable
+private fun InstrumentCard(
+    title: String,
+    subtitle: String,
+    modifier: Modifier,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Card(
+        modifier = modifier,
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
+    ) {
+        Column(Modifier.fillMaxSize().padding(14.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(title, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color(0xFF252329))
+                Spacer(Modifier.weight(1f))
+                Text("LIVE", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = instrumentAccent)
+            }
+            Text(subtitle, fontSize = 11.sp, color = Color.Gray, modifier = Modifier.padding(top = 3.dp, bottom = 10.dp))
+            content()
+        }
+    }
+}
+
+private fun noteAtSemitone(baseMidi: Int, semitone: Int): String = midiToNote(baseMidi + semitone)
+
+@Composable
+private fun TouchInstrumentSurface(
+    modifier: Modifier,
+    enabled: Boolean,
+    currentNote: String,
+    noteFromPosition: (Offset, androidx.compose.ui.unit.IntSize) -> String,
+    onNoteStart: (String) -> Unit,
+    onNoteEnd: (String) -> Unit,
+    drawContent: @Composable () -> Unit
+) {
+    var activeNote by remember { mutableStateOf<String?>(null) }
+    Box(
+        modifier = modifier.pointerInput(enabled) {
+            if (!enabled) return@pointerInput
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false)
+                val first = noteFromPosition(down.position, size)
+                activeNote = first
+                onNoteStart(first)
+                try {
+                    var released = false
+                    while (!released) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                        if (!change.pressed) {
+                            activeNote?.let(onNoteEnd)
+                            activeNote = null
+                            released = true
+                        } else {
+                            val next = noteFromPosition(change.position, size)
+                            if (next != activeNote) {
+                                activeNote?.let(onNoteEnd)
+                                activeNote = next
+                                onNoteStart(next)
+                            }
+                            change.consume()
+                        }
+                    }
+                } catch (_: CancellationException) {
+                    activeNote?.let(onNoteEnd)
+                    activeNote = null
+                }
+            }
+        }
+    ) {
+        drawContent()
+        if (currentNote.isNotEmpty()) {
+            Text(
+                currentNote,
+                modifier = Modifier.align(Alignment.TopEnd).padding(10.dp),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                color = instrumentAccent
+            )
+        }
+    }
+}
+
+@Composable
+private fun VirtualPiano(
+    modifier: Modifier,
+    enabled: Boolean,
+    currentNote: String,
+    onNoteStart: (String) -> Unit,
+    onNoteEnd: (String) -> Unit
+) {
+    val baseMidi = 48 // C3
+    val whiteNames = listOf("C","D","E","F","G","A","B")
+    val blackBoundaries = listOf(1,2,4,5,6)
+    InstrumentCard("VIRTUAL PIANO", "3 octaves • Tap or slide continuously across the keys", modifier) {
+        TouchInstrumentSurface(
+            Modifier.fillMaxWidth().weight(1f).background(Color(0xFFF1EFF5), RoundedCornerShape(16.dp)).padding(6.dp),
+            enabled, currentNote,
+            noteFromPosition = { pos, size ->
+                pianoNoteFromPosition(pos, size, baseMidi)
+            },
+            onNoteStart, onNoteEnd
+        ) {
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                val whiteCount = 21
+                val w = maxWidth / whiteCount
+                Row(Modifier.fillMaxSize()) {
+                    (0 until whiteCount).forEach { i ->
+                        Box(
+                            Modifier.weight(1f).fillMaxHeight().padding(horizontal = 1.dp)
+                                .background(if (currentNote == noteAtSemitone(baseMidi, whiteIndexToSemitone(i))) Color(0xFFD8C9F0) else Color.White, RoundedCornerShape(4.dp)),
+                            contentAlignment = Alignment.BottomCenter
+                        ) { Text(whiteNames[i % 7], fontSize = 8.sp, color = Color.Gray, modifier = Modifier.padding(bottom = 6.dp)) }
+                    }
+                }
+                val blackPattern = listOf(0,1,3,4,5)
+                (1 until whiteCount).forEach { boundary ->
+                    val posInOctave = boundary % 7
+                    if (posInOctave in blackPattern) {
+                        val note = noteAtSemitone(baseMidi, whiteIndexToSemitone(boundary - 1) + 1)
+                        Box(
+                            Modifier.offset(x = w * boundary - w * 0.30f)
+                                .width(w * 0.60f).fillMaxHeight(0.60f)
+                                .background(if (currentNote == note) Color(0xFF6750A4) else Color(0xFF242128), RoundedCornerShape(5.dp))
+                        )
+                    }
+                }
+            }
+        }
+        Text("C3 → B5 • 21 white keys + black keys", Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center, fontSize = 11.sp, color = Color.Gray)
+    }
+}
+
+private fun pianoNoteFromPosition(
+    position: Offset,
+    size: androidx.compose.ui.unit.IntSize,
+    baseMidi: Int
+): String {
+    val whiteCount = 21
+    val whiteWidth = size.width.toFloat() / whiteCount
+    val whiteIndex = (position.x / whiteWidth).toInt().coerceIn(0, whiteCount - 1)
+
+    // On the upper part of the keyboard, prefer black keys when the finger
+    // is near a black-key center. This makes both tapping and sliding behave
+    // like a real piano keyboard.
+    if (position.y < size.height * 0.58f) {
+        val boundary = (position.x / whiteWidth).roundToInt()
+        val blackPositions = setOf(1, 2, 4, 5, 6, 8, 9, 11, 12, 13, 15, 16, 18, 19, 20)
+        if (boundary in blackPositions && boundary in 1 until whiteCount) {
+            val center = boundary * whiteWidth
+            if (abs(position.x - center) <= whiteWidth * 0.30f) {
+                return noteAtSemitone(baseMidi, whiteIndexToSemitone(boundary - 1) + 1)
+            }
+        }
+    }
+
+    return noteAtSemitone(baseMidi, whiteIndexToSemitone(whiteIndex))
+}
+
+private fun whiteIndexToSemitone(index: Int): Int {
+    val octave = index / 7
+    return octave * 12 + listOf(0,2,4,5,7,9,11)[index % 7]
+}
+
+@Composable
+private fun VirtualSynth(
+    modifier: Modifier,
+    enabled: Boolean,
+    currentNote: String,
+    onNoteStart: (String) -> Unit,
+    onNoteEnd: (String) -> Unit
+) {
+    val baseMidi = 48
+    InstrumentCard("VIRTUAL SYNTHESIZER", "Continuous performance surface • slide for pitch sweeps", modifier) {
+        Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf("OSC 1", "OSC 2", "FILTER", "LFO", "ENV").forEach { label ->
+                Card(Modifier.weight(1f), shape = RoundedCornerShape(9.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFF0ECF7))) {
+                    Text(label, Modifier.fillMaxWidth().padding(vertical = 7.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+        TouchInstrumentSurface(
+            Modifier.fillMaxWidth().weight(1f).background(Color(0xFF17151A), RoundedCornerShape(16.dp)).padding(8.dp),
+            enabled, currentNote,
+            { pos, size ->
+                val index = (pos.x / size.width * 36f).toInt().coerceIn(0,35)
+                noteAtSemitone(baseMidi, index)
+            }, onNoteStart, onNoteEnd
+        ) {
+            Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Row(Modifier.fillMaxWidth().weight(1f)) {
+                    (0 until 36).forEach { i ->
+                        Box(Modifier.weight(1f).fillMaxHeight().padding(1.dp).background(if (currentNote == noteAtSemitone(baseMidi,i)) Color(0xFF9A7BC7) else Color(0xFF302B35), RoundedCornerShape(2.dp)))
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                Text("C3                 C4                 C5", Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center, fontSize = 9.sp, color = Color.LightGray)
+            }
+        }
+    }
+}
+
+@Composable
+private fun VirtualGuitar(
+    modifier: Modifier,
+    enabled: Boolean,
+    currentNote: String,
+    onNoteStart: (String) -> Unit,
+    onNoteEnd: (String) -> Unit
+) {
+    val openMidi = listOf(40,45,50,55,59,64)
+    val names = listOf("E","A","D","G","B","E")
+    InstrumentCard("VIRTUAL GUITAR", "6 strings • 15 frets • Slide across the fretboard", modifier) {
+        TouchInstrumentSurface(
+            Modifier.fillMaxWidth().weight(1f).background(Color(0xFF7A5636), RoundedCornerShape(16.dp)).padding(8.dp),
+            enabled, currentNote,
+            { pos, size ->
+                val stringIndex = (pos.y / size.height * 6f).toInt().coerceIn(0,5)
+                val fret = (pos.x / size.width * 16f).toInt().coerceIn(0,15)
+                noteAtSemitone(openMidi[stringIndex], fret)
+            }, onNoteStart, onNoteEnd
+        ) {
+            Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.SpaceEvenly) {
+                names.forEachIndexed { index, name ->
+                    Box(Modifier.fillMaxWidth().height(30.dp)) {
+                        androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+                            drawLine(Color(0xFFE9D7B8), Offset(0f, size.height/2f), Offset(size.width, size.height/2f), strokeWidth = 2f + index)
+                        }
+                        Text(name, Modifier.align(Alignment.CenterStart).padding(start = 3.dp), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    }
+                }
+            }
+        }
+        Text("E2  A2  D3  G3  B3  E4  •  fret 0–15", Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center, fontSize = 10.sp, color = Color.Gray)
+    }
+}
+
+@Composable
+private fun VirtualViolin(
+    modifier: Modifier,
+    enabled: Boolean,
+    currentNote: String,
+    onNoteStart: (String) -> Unit,
+    onNoteEnd: (String) -> Unit
+) {
+    val openMidi = listOf(55,62,69,76)
+    val names = listOf("G","D","A","E")
+    InstrumentCard("VIRTUAL VIOLIN", "4 strings • Fingerboard with continuous position control", modifier) {
+        TouchInstrumentSurface(
+            Modifier.fillMaxWidth().weight(1f).background(Color(0xFF34251C), RoundedCornerShape(16.dp)).padding(12.dp),
+            enabled, currentNote,
+            { pos, size ->
+                val stringIndex = (pos.y / size.height * 4f).toInt().coerceIn(0,3)
+                val position = (pos.x / size.width * 24f).toInt().coerceIn(0,23)
+                noteAtSemitone(openMidi[stringIndex], position)
+            }, onNoteStart, onNoteEnd
+        ) {
+            Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.SpaceEvenly) {
+                names.forEachIndexed { index, name ->
+                    Box(Modifier.fillMaxWidth().height(34.dp)) {
+                        androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+                            drawLine(Color(0xFFD8B58A), Offset(0f,size.height/2f), Offset(size.width,size.height/2f), strokeWidth = 2f + index)
+                        }
+                        Text(name, Modifier.align(Alignment.CenterStart), fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    }
+                }
+            }
+        }
+        Text("G3 → E7 • 2 octaves per string", Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center, fontSize = 10.sp, color = Color.Gray)
+    }
+}
+
+@Composable
+private fun VirtualDrumKit(
+    modifier: Modifier,
+    enabled: Boolean,
+    currentNote: String,
+    onNoteStart: (String) -> Unit,
+    onNoteEnd: (String) -> Unit
+) {
+    val pads = listOf(
+        "KICK" to 36, "SNARE" to 38, "CLOSED HAT" to 42,
+        "OPEN HAT" to 46, "LOW TOM" to 45, "MID TOM" to 47,
+        "HIGH TOM" to 50, "CRASH" to 49, "RIDE" to 51
+    )
+    InstrumentCard("VIRTUAL DRUM KIT", "9-piece pad layout • Tap or drag between pads", modifier) {
+        TouchInstrumentSurface(
+            Modifier.fillMaxWidth().weight(1f),
+            enabled, currentNote,
+            { pos, size ->
+                val col = (pos.x / size.width * 3f).toInt().coerceIn(0,2)
+                val row = (pos.y / size.height * 3f).toInt().coerceIn(0,2)
+                val idx = row * 3 + col
+                midiToNote(pads[idx].second)
+            }, onNoteStart, onNoteEnd
+        ) {
+            Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                pads.chunked(3).forEach { row ->
+                    Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        row.forEach { (label,midi) ->
+                            Card(Modifier.weight(1f).fillMaxHeight(), shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = if (currentNote == midiToNote(midi)) Color(0xFFD8C9F0) else Color(0xFFF3F1F5))) {
+                                Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                                    Text("●", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = instrumentAccent)
+                                    Text(label, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 
@@ -2437,189 +3222,54 @@ fun noteFromPosition(
     scale: String,
     octave: String
 ): String {
+    if (canvasWidth <= 0f) return "C4"
 
-    if (canvasWidth <= 0f) {
-        return "C4"
+    val intervals = when (scale) {
+        "Major" -> listOf(0, 2, 4, 5, 7, 9, 11)
+        "Minor" -> listOf(0, 2, 3, 5, 7, 8, 10)
+        "Pentatonic" -> listOf(0, 2, 4, 7, 9)
+        "Blues" -> listOf(0, 3, 5, 6, 7, 10)
+        "Chromatic" -> (0..11).toList()
+        else -> listOf(0, 2, 4, 5, 7, 9, 11)
     }
 
+    val keySemitone = when (key) {
+        "C" -> 0; "D" -> 2; "E" -> 4; "F" -> 5
+        "G" -> 7; "A" -> 9; "B" -> 11; else -> 0
+    }
 
-    // ========================================================
-    // SCALE INTERVALS
-    // ========================================================
+    val baseOctave = when (octave) {
+        "Low" -> 2
+        "Middle" -> 4
+        "High" -> 6
+        else -> 4
+    }
 
-    val intervals =
-        when (scale) {
+    // The complete drawing width covers FOUR octaves instead of only eight
+    // zones. This makes the canvas musically useful across a much larger range.
+    val normalizedX = (x / canvasWidth).coerceIn(0f, 0.999999f)
+    val semitonePosition = normalizedX * 48f
+    val rawSemitone = floor(semitonePosition).toInt()
 
-            "Major" ->
-                listOf(
-                    0,
-                    2,
-                    4,
-                    5,
-                    7,
-                    9,
-                    11
-                )
+    val chromaticMidi = (baseOctave + 1) * 12 + keySemitone + rawSemitone
 
-            "Minor" ->
-                listOf(
-                    0,
-                    2,
-                    3,
-                    5,
-                    7,
-                    8,
-                    10
-                )
+    if (scale == "Chromatic") {
+        return midiToNote(chromaticMidi)
+    }
 
-            "Pentatonic" ->
-                listOf(
-                    0,
-                    2,
-                    4,
-                    7,
-                    9
-                )
+    // Snap the chromatic position to the nearest note in the selected scale,
+    // while preserving all four octaves.
+    val octaveOffset = rawSemitone / 12
+    val withinOctave = rawSemitone % 12
+    val nearest = intervals.minByOrNull { abs(it - withinOctave) } ?: 0
+    val scaleMidi = (baseOctave + octaveOffset + 1) * 12 + keySemitone + nearest
+    return midiToNote(scaleMidi)
+}
 
-            "Blues" ->
-                listOf(
-                    0,
-                    3,
-                    5,
-                    6,
-                    7,
-                    10
-                )
-
-            "Chromatic" ->
-                (0..11).toList()
-
-            else ->
-                listOf(
-                    0,
-                    2,
-                    4,
-                    5,
-                    7,
-                    9,
-                    11
-                )
-        }
-
-
-    // ========================================================
-    // KEY
-    // ========================================================
-
-    val keySemitone =
-        when (key) {
-
-            "C" -> 0
-            "D" -> 2
-            "E" -> 4
-            "F" -> 5
-            "G" -> 7
-            "A" -> 9
-            "B" -> 11
-
-            else -> 0
-        }
-
-
-    // ========================================================
-    // OCTAVE
-    // ========================================================
-
-    val baseOctave =
-        when (octave) {
-
-            "Low" ->
-                3
-
-            "Middle" ->
-                4
-
-            "High" ->
-                5
-
-            else ->
-                4
-        }
-
-
-    // ========================================================
-    // X POSITION
-    // ========================================================
-
-    val normalizedX =
-        (x / canvasWidth)
-            .coerceIn(
-                0f,
-                0.999999f
-            )
-
-    // Eight zones across canvas
-    val noteIndex =
-        (normalizedX * 8)
-            .toInt()
-            .coerceIn(
-                0,
-                7
-            )
-
-
-    // ========================================================
-    // SCALE POSITION
-    // ========================================================
-
-    val scaleIndex =
-        noteIndex %
-                intervals.size
-
-    val octaveOffset =
-        noteIndex /
-                intervals.size
-
-    val semitone =
-        keySemitone +
-                intervals[
-                    scaleIndex
-                ]
-
-    val totalSemitones =
-        semitone % 12
-
-    val octaveCarry =
-        semitone / 12
-
-    val finalOctave =
-        baseOctave +
-                octaveOffset +
-                octaveCarry
-
-
-    val noteNames =
-        listOf(
-            "C",
-            "C#",
-            "D",
-            "D#",
-            "E",
-            "F",
-            "F#",
-            "G",
-            "G#",
-            "A",
-            "A#",
-            "B"
-        )
-
-
-    return "${
-        noteNames[
-            totalSemitones
-        ]
-    }$finalOctave"
+private fun midiToNote(midi: Int): String {
+    val names = listOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+    val safeMidi = midi.coerceIn(0, 127)
+    return "${names[safeMidi % 12]}${safeMidi / 12 - 1}"
 }
 
 
@@ -2627,95 +3277,19 @@ fun noteFromPosition(
 // NOTE → FREQUENCY
 // ============================================================
 
-fun frequencyFromNote(
-    note: String
-): Double {
+fun frequencyFromNote(note: String): Double {
+    if (note.length < 2) return 261.625565
 
-    val noteNames =
-        mapOf(
-            "C" to 0,
-            "C#" to 1,
-            "D" to 2,
-            "D#" to 3,
-            "E" to 4,
-            "F" to 5,
-            "F#" to 6,
-            "G" to 7,
-            "G#" to 8,
-            "A" to 9,
-            "A#" to 10,
-            "B" to 11
-        )
+    val noteNames = mapOf(
+        "C" to 0, "C#" to 1, "D" to 2, "D#" to 3,
+        "E" to 4, "F" to 5, "F#" to 6, "G" to 7,
+        "G#" to 8, "A" to 9, "A#" to 10, "B" to 11
+    )
 
-
-    if (note.length < 2) {
-        return 261.63
-    }
-
-
-    val noteName =
-        if (
-            note.length >= 2 &&
-            note[1] == '#'
-        ) {
-
-            note.substring(
-                0,
-                2
-            )
-
-        } else {
-
-            note.substring(
-                0,
-                1
-            )
-        }
-
-
-    val octaveStart =
-        if (
-            note.length >= 2 &&
-            note[1] == '#'
-        ) {
-
-            2
-
-        } else {
-
-            1
-        }
-
-
-    val octave =
-        note.substring(
-            octaveStart
-        )
-            .toIntOrNull()
-            ?: 4
-
-
-    val semitone =
-        noteNames[
-            noteName
-        ]
-            ?: 0
-
-
-    // MIDI note number
-    val midi =
-        (
-                octave + 1
-                ) * 12 +
-                semitone
-
-
-    // A4 = MIDI 69
-    return 440.0 *
-            Math.pow(
-                2.0,
-                (
-                        midi - 69
-                        ) / 12.0
-            )
+    val noteName = if (note.length >= 2 && note[1] == '#') note.substring(0, 2) else note.substring(0, 1)
+    val octaveStart = if (note.length >= 2 && note[1] == '#') 2 else 1
+    val octave = note.substring(octaveStart).toIntOrNull() ?: 4
+    val semitone = noteNames[noteName] ?: 0
+    val midi = (octave + 1) * 12 + semitone
+    return 440.0 * Math.pow(2.0, (midi - 69) / 12.0)
 }
