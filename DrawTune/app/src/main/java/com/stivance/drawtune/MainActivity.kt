@@ -692,7 +692,7 @@ fun DrawTuneApp(
     val wifiManager = remember { DrawTuneWifiManager() }
 
     var wifiIpAddress by remember {
-        mutableStateOf("192.168.4.1")
+        mutableStateOf("10.175.33.200")
     }
 
     var wifiConnected by remember {
